@@ -1,0 +1,152 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Audio Engagement Analytics - Event Processing Infrastructure'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name
+  LambdaS3Bucket:
+    Type: String
+    Description: S3 bucket containing the Lambda function code
+  LambdaS3Key:
+    Type: String
+    Description: S3 key for the Lambda function code package
+
+Resources:
+  # DynamoDB Table
+  PlaybackEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub PlaybackEvents-${Environment}
+      AttributeDefinitions:
+        - AttributeName: event_id
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: event_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: UserTimestampIndex
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: 5
+            WriteCapacityUnits: 5
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # Dead Letter Queue
+  ProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub playback-events-dlq-${Environment}
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  # Lambda Execution Role
+  ProcessEventsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub process-events-role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt PlaybackEventsTable.Arn
+        - PolicyName: KinesisAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:DescribeStream
+                  - kinesis:ListShards
+                Resource: !Sub arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/AudiobookPlaybackStream
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt ProcessingDLQ.Arn
+
+  # Lambda Function
+  ProcessEventsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub process-playback-events-${Environment}
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref LambdaS3Key
+      Handler: process_events.lambda_handler
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref PlaybackEventsTable
+          LOG_LEVEL: INFO
+      Role: !GetAtt ProcessEventsLambdaRole.Arn
+      DeadLetterConfig:
+        TargetArn: !GetAtt ProcessingDLQ.Arn
+
+  # Event Source Mapping
+  KinesisEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      FunctionName: !Ref ProcessEventsFunction
+      EventSourceArn: !Sub arn:aws:kinesis:${AWS::Region}:${AWS::AccountId}:stream/AudiobookPlaybackStream
+      StartingPosition: TRIM_HORIZON
+      BatchSize: 100
+      MaximumBatchingWindowInSeconds: 60
+      MaximumRetryAttempts: 3
+      BisectBatchOnFunctionError: true
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt ProcessingDLQ.Arn
+
+Outputs:
+  TableName:
+    Description: DynamoDB table name
+    Value: !Ref PlaybackEventsTable
+  FunctionName:
+    Description: Lambda function name
+    Value: !Ref ProcessEventsFunction
+  FunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt ProcessEventsFunction.Arn
+  DLQUrl:
+    Description: Dead Letter Queue URL
+    Value: !Ref ProcessingDLQ 
